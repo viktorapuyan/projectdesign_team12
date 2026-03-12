@@ -9,7 +9,8 @@ Author: Python Software Engineer
 Date: January 29, 2026
 """
 
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Optional
+import os
 import math
 import numpy as np
 import matplotlib.pyplot as plt
@@ -402,6 +403,228 @@ def export_to_svg(dieline: CartonDieline, filename: str = 'carton_dieline.svg',
     return filename
 
 
+def _svg_reference_layout_dimensions(length: float, width: float, height: float) -> Dict[str, float]:
+    """Return layout dimensions for the reference-based carton template."""
+    flap_depth = max(width * 0.5, 6.0)
+    glue_tab_width = max(width * 0.18, 3.0)
+    board_gap = max(min(width * 0.01, 0.4), 0.15)
+
+    return {
+        'panel_1_width': width,
+        'panel_2_width': length,
+        'panel_3_width': width,
+        'panel_4_width': length,
+        'panel_height': height,
+        'flap_depth': flap_depth,
+        'glue_tab_width': glue_tab_width,
+        'board_gap': board_gap,
+    }
+
+
+def build_reference_svg(length: float, width: float, height: float,
+                        filename: str = 'carton_dieline.svg',
+                        scale: float = 16.0) -> str:
+    """
+    Export a carton dieline that follows the layout proportions of SVG File-01.svg.
+
+    The layout is generated from adjusted carton dimensions and includes:
+    - A tapered glue tab on the left
+    - Four body panels in sequence: side, front, side, back
+    - Full-width outer flaps with U-slot cuts at panel boundaries
+    - Red crease/fold lines that never overlap black cut lines
+    """
+    layout = _svg_reference_layout_dimensions(length, width, height)
+    panel_1_width = layout['panel_1_width']
+    panel_2_width = layout['panel_2_width']
+    panel_3_width = layout['panel_3_width']
+    panel_4_width = layout['panel_4_width']
+    panel_height = layout['panel_height']
+    flap_depth = layout['flap_depth']
+    glue_tab_width = layout['glue_tab_width']
+    board_gap = layout['board_gap']
+
+    margin = 2.0
+    body_x0 = margin + glue_tab_width
+    body_y0 = margin + flap_depth
+    body_y1 = body_y0 + panel_height
+
+    x0 = body_x0
+    x1 = x0 + panel_1_width
+    x2 = x1 + panel_2_width
+    x3 = x2 + panel_3_width
+    x4 = x3 + panel_4_width
+
+    outer_left  = margin
+    outer_right = x4 + margin
+    outer_top   = margin
+    outer_bottom = body_y1 + flap_depth + margin
+
+    canvas_width  = (outer_right - outer_left) * scale
+    canvas_height = (outer_bottom - outer_top) * scale
+
+    top_flap_y    = body_y0 - flap_depth
+    bottom_flap_y = body_y1 + flap_depth
+
+    # U-slot tips stop just short of the fold line so cut never touches fold
+    slit_top    = body_y0 - board_gap   # top slits end here (above fold at body_y0)
+    slit_bottom = body_y1 + board_gap   # bottom slits end here (below fold at body_y1)
+
+    bleed_points = [
+        (outer_left,         outer_bottom),
+        (outer_left,         body_y1 + 0.25),
+        (outer_left - 0.35,  body_y1),
+        (outer_left - 0.35,  body_y0),
+        (outer_left,         body_y0 - 0.25),
+        (outer_left,         outer_top),
+        (outer_right,        outer_top),
+        (outer_right,        body_y0 - 0.25),
+        (outer_right + 0.15, body_y0 - 0.25),
+        (outer_right + 0.15, body_y1 + 0.25),
+        (outer_right,        body_y1 + 0.25),
+        (outer_right,        outer_bottom),
+    ]
+
+    def fmt_points(points: List[Tuple[float, float]]) -> str:
+        return ' '.join(f'{px * scale:.2f},{py * scale:.2f}' for px, py in points)
+
+    def svg_line(ax1: float, ay1: float, ax2: float, ay2: float,
+                 cls: str = 'cls-3') -> str:
+        return (
+            f'<line class="{cls}" x1="{ax1 * scale:.2f}" y1="{ay1 * scale:.2f}" '
+            f'x2="{ax2 * scale:.2f}" y2="{ay2 * scale:.2f}"/>'
+        )
+
+    def svg_polyline(points: List[Tuple[float, float]], cls: str = 'cls-2') -> str:
+        return f'<polyline class="{cls}" points="{fmt_points(points)}"/>'
+
+    # ================================================================
+    # FOLD / CREASE LINES (red dashed)
+    # Rule: fold lines occupy the body interior ONLY.
+    #   • Horizontal folds at body_y0 and body_y1 span full body width (x0→x4).
+    #   • Vertical folds at x0..x3 span body height only (body_y0→body_y1).
+    #   • x4 has NO fold line — it is purely a cut boundary.
+    # ================================================================
+    fold_lines = [
+        svg_line(x0, body_y0, x4, body_y0),   # top horizontal fold
+        svg_line(x0, body_y1, x4, body_y1),   # bottom horizontal fold
+        svg_line(x0, body_y0, x0, body_y1),   # glue-tab / panel-1 fold
+        svg_line(x1, body_y0, x1, body_y1),   # panel-1 / panel-2 fold
+        svg_line(x2, body_y0, x2, body_y1),   # panel-2 / panel-3 fold
+        svg_line(x3, body_y0, x3, body_y1),   # panel-3 / panel-4 fold
+    ]
+
+    # ================================================================
+    # CUT LINES (black solid)
+    # Rule: no cut segment may lie on the same coordinates as a fold segment.
+    #
+    #  Glue tab  — open 3-sided path; the right edge IS the fold at x0,
+    #              so only left + top-slant + bottom-slant are drawn.
+    #  Top flap  — horizontal cuts at top_flap_y, interrupted by U-slots
+    #              at x1, x2, x3; slot tips stop at slit_top (above fold).
+    #  Bot flap  — same pattern at bottom_flap_y / slit_bottom.
+    #  Left side — two short verticals at x0 bridging fold endpoints to
+    #              outer flap edges; they share endpoints with the fold
+    #              but cover different y-ranges (no overlap).
+    #  Right side — single vertical at x4 (no fold here).
+    # ================================================================
+
+    glue_inset   = panel_height * 0.03
+    glue_inner_x = outer_left + glue_tab_width * 0.18
+
+    # Glue tab: 3 sides only (right edge omitted — covered by fold at x0)
+    glue_tab_cut = svg_polyline([
+        (x0,           body_y0),
+        (glue_inner_x, body_y0 + glue_inset),
+        (glue_inner_x, body_y1 - glue_inset),
+        (x0,           body_y1),
+    ])
+
+    # Top flap: 4 horizontal segments + 3 U-shaped slot cuts
+    top_h1  = svg_line(x0,               top_flap_y, x1 - board_gap, top_flap_y, 'cls-2')
+    slit1_t = svg_polyline([(x1 - board_gap, top_flap_y),
+                             (x1 - board_gap, slit_top),
+                             (x1 + board_gap, slit_top),
+                             (x1 + board_gap, top_flap_y)])
+    top_h2  = svg_line(x1 + board_gap, top_flap_y, x2 - board_gap, top_flap_y, 'cls-2')
+    slit2_t = svg_polyline([(x2 - board_gap, top_flap_y),
+                             (x2 - board_gap, slit_top),
+                             (x2 + board_gap, slit_top),
+                             (x2 + board_gap, top_flap_y)])
+    top_h3  = svg_line(x2 + board_gap, top_flap_y, x3 - board_gap, top_flap_y, 'cls-2')
+    slit3_t = svg_polyline([(x3 - board_gap, top_flap_y),
+                             (x3 - board_gap, slit_top),
+                             (x3 + board_gap, slit_top),
+                             (x3 + board_gap, top_flap_y)])
+    top_h4  = svg_line(x3 + board_gap, top_flap_y, x4, top_flap_y, 'cls-2')
+
+    # Bottom flap: 4 horizontal segments + 3 U-shaped slot cuts
+    bot_h1  = svg_line(x0,               bottom_flap_y, x1 - board_gap, bottom_flap_y, 'cls-2')
+    slit1_b = svg_polyline([(x1 - board_gap, bottom_flap_y),
+                             (x1 - board_gap, slit_bottom),
+                             (x1 + board_gap, slit_bottom),
+                             (x1 + board_gap, bottom_flap_y)])
+    bot_h2  = svg_line(x1 + board_gap, bottom_flap_y, x2 - board_gap, bottom_flap_y, 'cls-2')
+    slit2_b = svg_polyline([(x2 - board_gap, bottom_flap_y),
+                             (x2 - board_gap, slit_bottom),
+                             (x2 + board_gap, slit_bottom),
+                             (x2 + board_gap, bottom_flap_y)])
+    bot_h3  = svg_line(x2 + board_gap, bottom_flap_y, x3 - board_gap, bottom_flap_y, 'cls-2')
+    slit3_b = svg_polyline([(x3 - board_gap, bottom_flap_y),
+                             (x3 - board_gap, slit_bottom),
+                             (x3 + board_gap, slit_bottom),
+                             (x3 + board_gap, bottom_flap_y)])
+    bot_h4  = svg_line(x3 + board_gap, bottom_flap_y, x4, bottom_flap_y, 'cls-2')
+
+    # Left flap side cuts: share only endpoints with folds (different y-ranges → no overlap)
+    left_top_side = svg_line(x0, top_flap_y,  x0, body_y0,       'cls-2')
+    left_bot_side = svg_line(x0, body_y1,      x0, bottom_flap_y, 'cls-2')
+
+    # Right outer edge: single vertical (x4 has no fold at all)
+    right_side = svg_line(x4, top_flap_y, x4, bottom_flap_y, 'cls-2')
+
+    dimension_note_y = outer_bottom - 0.65
+    svg_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {canvas_width:.2f} {canvas_height:.2f}">'
+        ),
+        '<defs><style>'
+        '.cls-1{fill:#ffca8a;opacity:.18;}'
+        '.cls-2,.cls-3{fill:none;stroke-miterlimit:10;}'
+        '.cls-2{stroke:#000;stroke-width:1.8;}'
+        '.cls-3{stroke:#d62828;stroke-width:1.2;stroke-dasharray:10 8;}'
+        '.label{font-family:Arial,sans-serif;font-size:18px;fill:#1f4e79;font-weight:bold;}'
+        '.meta{font-family:Arial,sans-serif;font-size:16px;fill:#333;}'
+        '</style></defs>',
+        '<title>Carton Dieline</title>',
+        '<g id="Design_Here">',
+        f'<polygon id="Out_Side_Bleed" class="cls-1" points="{fmt_points(bleed_points)}"/>',
+        '</g>',
+        '<g id="Cut_Line">',
+        glue_tab_cut,
+        left_top_side,
+        left_bot_side,
+        right_side,
+        top_h1, slit1_t, top_h2, slit2_t, top_h3, slit3_t, top_h4,
+        bot_h1, slit1_b, bot_h2, slit2_b, bot_h3, slit3_b, bot_h4,
+        '</g>',
+        '<g id="Fold_Line">',
+        *fold_lines,
+        '</g>',
+        '<g id="Labels">',
+        '</g>',
+        '<g id="Meta">',
+        '</g>',
+        '</svg>',
+    ]
+
+    with open(filename, 'w', encoding='utf-8') as svg_file:
+        svg_file.write('\n'.join(svg_lines))
+
+    return os.path.abspath(filename)
+
+
 def create_carton_dieline(length: float, width: float, height: float,
                          export_svg: bool = False,
                          svg_filename: str = 'carton_dieline.svg') -> CartonDieline:
@@ -450,7 +673,7 @@ def create_carton_dieline(length: float, width: float, height: float,
     
     # Step 4: Optional SVG export
     if export_svg:
-        svg_path = export_to_svg(dieline, svg_filename)
+        svg_path = build_reference_svg(adjusted_length, adjusted_width, adjusted_height, svg_filename)
         print(f"Exported dieline to: {svg_path}")
     
     return dieline
@@ -512,303 +735,60 @@ def generate_dieline(width: float, height: float, length: float,
         >>> width, height, length = 20.0, 15.0, 30.0
         >>> fig = generate_dieline(width, height, length, show=True)
     """
-    
-    # Step 1: Add clearance for packaging (6 cm standard)
-    clearance = 6.0
-    adj_width = width + clearance
-    adj_height = height + clearance
-    adj_length = length + clearance
-    
+    adjusted_length, adjusted_width, adjusted_height = adjust_dimensions(length, width, height)
+
     print(f"Input dimensions: W={width}cm, H={height}cm, L={length}cm")
-    print(f"Adjusted dimensions: W={adj_width}cm, H={adj_height}cm, L={adj_length}cm")
-    
-    # Step 2: Calculate flap size (typically 50% of width for RSC boxes)
-    flap_height = adj_width * 0.5
-    
-    # Glue tab width (for manufacturer's joint)
-    glue_tab_width = adj_width * 0.3
-    
-    # Step 3: Compute panel positions for RSC box layout
-    # Horizontal layout: [Glue Tab] [Front] [Side] [Back] [Side]
-    
-    start_x = glue_tab_width + 2  # Add small gap after glue tab
-    start_y = flap_height  # Offset for bottom flaps
-    
-    panels = []
-    top_flaps = []
-    bottom_flaps = []
-    glue_tabs = []
-    
-    current_x = start_x
-    
-    # Main panel strip (4 panels)
-    # 1. Front panel
-    panels.append(('Front', current_x, start_y, adj_length, adj_height))
-    current_x += adj_length
-    
-    # 2. Left Side panel
-    panels.append(('Side', current_x, start_y, adj_width, adj_height))
-    current_x += adj_width
-    
-    # 3. Back panel
-    panels.append(('Back', current_x, start_y, adj_length, adj_height))
-    current_x += adj_length
-    
-    # 4. Right Side panel
-    panels.append(('Side', current_x, start_y, adj_width, adj_height))
-    
-    # Glue tab on the left (manufacturer's joint)
-    glue_tabs.append(('Glue Tab', 0, start_y + adj_height * 0.15, glue_tab_width, adj_height * 0.7))
-    
-    # Top flaps (above each panel)
-    top_flaps.append(('Top Flap', start_x, start_y + adj_height, adj_length, flap_height))
-    top_flaps.append(('Top Flap', start_x + adj_length, start_y + adj_height, adj_width, flap_height))
-    top_flaps.append(('Top Flap', start_x + adj_length + adj_width, start_y + adj_height, adj_length, flap_height))
-    top_flaps.append(('Top Flap', start_x + 2 * adj_length + adj_width, start_y + adj_height, adj_width, flap_height))
-    
-    # Bottom flaps (below each panel)
-    bottom_flaps.append(('Bottom Flap', start_x, start_y - flap_height, adj_length, flap_height))
-    bottom_flaps.append(('Bottom Flap', start_x + adj_length, start_y - flap_height, adj_width, flap_height))
-    bottom_flaps.append(('Bottom Flap', start_x + adj_length + adj_width, start_y - flap_height, adj_length, flap_height))
-    bottom_flaps.append(('Bottom Flap', start_x + 2 * adj_length + adj_width, start_y - flap_height, adj_width, flap_height))
-    
-    # Step 4: Calculate total dimensions
-    total_width = 2 * adj_length + 2 * adj_width + glue_tab_width
-    total_height = adj_height + 2 * flap_height
-    
-    # Step 5: Draw the RSC carton box dieline using matplotlib
-    fig, ax = plt.subplots(1, 1, figsize=(20, 10))
-    ax.set_facecolor('white')
-    
-    # Draw main panels (white fill)
-    for name, x, y, w, h in panels:
-        rect = patches.Rectangle((x, y), w, h, linewidth=0, 
-                                 facecolor='white', alpha=1.0)
-        ax.add_patch(rect)
-    
-    # Draw flaps as simple rectangles (white fill)
-    for name, x, y, w, h in top_flaps:
-        rect = patches.Rectangle((x, y), w, h, linewidth=0, 
-                                 facecolor='white', alpha=1.0)
-        ax.add_patch(rect)
-    
-    for name, x, y, w, h in bottom_flaps:
-        rect = patches.Rectangle((x, y), w, h, linewidth=0, 
-                                 facecolor='white', alpha=1.0)
-        ax.add_patch(rect)
-    
-    # Define cut line properties
-    cut_line_color = 'blue'
-    cut_line_width = 2.5
-    
-    top_edge_y = start_y + adj_height + flap_height
-    bottom_edge_y = start_y - flap_height
-    right_edge_x = start_x + 2 * adj_length + 2 * adj_width
-    
-    # Draw SIMPLE RECTANGULAR FLAPS - outer edges only (blue cut lines)
-    # Top outer edge (straight across all flaps)
-    ax.plot([start_x, right_edge_x], [top_edge_y, top_edge_y],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')
-    
-    # Bottom outer edge (straight across all flaps)
-    ax.plot([start_x, right_edge_x], [bottom_edge_y, bottom_edge_y],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')
-    
-    # Left outer edges for top and bottom flaps (connecting them to glue tab area)
-    # Top left flap outer edge
-    ax.plot([glue_tab_width, glue_tab_width], [start_y + adj_height, top_edge_y],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')
-    # Bottom left flap outer edge
-    ax.plot([glue_tab_width, glue_tab_width], [bottom_edge_y, start_y],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')
-    # Top left corner connector
-    ax.plot([glue_tab_width, start_x], [top_edge_y, top_edge_y],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')
-    # Bottom left corner connector
-    ax.plot([glue_tab_width, start_x], [bottom_edge_y, bottom_edge_y],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')
-    
-    # Draw RECTANGULAR GLUE TAB on the left (blue cut lines)
-    glue_tab_x = 0
-    glue_tab_y = start_y
-    glue_tab_rect_width = glue_tab_width
-    glue_tab_rect_height = adj_height
-    
-    # Draw rectangle for glue tab
-    ax.plot([glue_tab_x, glue_tab_x + glue_tab_rect_width], [glue_tab_y, glue_tab_y],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')  # Bottom
-    ax.plot([glue_tab_x + glue_tab_rect_width, glue_tab_x + glue_tab_rect_width], [glue_tab_y, glue_tab_y + glue_tab_rect_height],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')  # Right
-    ax.plot([glue_tab_x + glue_tab_rect_width, glue_tab_x], [glue_tab_y + glue_tab_rect_height, glue_tab_y + glue_tab_rect_height],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')  # Top
-    ax.plot([glue_tab_x, glue_tab_x], [glue_tab_y + glue_tab_rect_height, glue_tab_y],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')  # Left
-    
-    # Fill the rectangle
-    from matplotlib.patches import Rectangle
-    glue_tab_patch = Rectangle((glue_tab_x, glue_tab_y), glue_tab_rect_width, glue_tab_rect_height,
-                                facecolor='white', edgecolor='none')
-    ax.add_patch(glue_tab_patch)
-    
-    # Draw connection line from glue tab to left panel (red dashed crease)
-    glue_tab_center_y = glue_tab_y + glue_tab_rect_height / 2
-    ax.plot([glue_tab_x + glue_tab_rect_width, start_x], [glue_tab_center_y, glue_tab_center_y],
-           color='red', linestyle='--', linewidth=2.0, dashes=(8, 4), solid_capstyle='butt')
-    
-    # Left side edges connecting flaps to main body (blue cut lines)
-    ax.plot([start_x, start_x], [bottom_edge_y, start_y],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')
-    ax.plot([start_x, start_x], [start_y + adj_height, top_edge_y],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')
-    
-    # Right outer edge (straight)
-    ax.plot([right_edge_x, right_edge_x], [bottom_edge_y, top_edge_y],
-           color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')
-    
-    # Vertical cut lines between flaps (blue)
-    flap_divider_positions = [
-        start_x + adj_length,  # Between flaps
-        start_x + adj_length + adj_width,
-        start_x + 2 * adj_length + adj_width,
-    ]
-    
-    for divider_x in flap_divider_positions:
-        # Top flap dividers
-        ax.plot([divider_x, divider_x], [start_y + adj_height, top_edge_y],
-               color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')
-        # Bottom flap dividers
-        ax.plot([divider_x, divider_x], [bottom_edge_y, start_y],
-               color=cut_line_color, linestyle='-', linewidth=cut_line_width, solid_capstyle='butt')
-    
-    # Draw SOFT CREASE LINES (Red dashed - vertical dividers between panels)
-    crease_positions_vertical = [
-        start_x + adj_length,  # Between front and side
-        start_x + adj_length + adj_width,  # Between side and back
-        start_x + 2 * adj_length + adj_width,  # Between back and side
-    ]
-    
-    for crease_x in crease_positions_vertical:
-        ax.plot([crease_x, crease_x], [start_y, start_y + adj_height],
-               color='red', linestyle='--', linewidth=2.0, dashes=(8, 4), solid_capstyle='butt')
-    
-    # Horizontal soft crease lines (separating flaps from main panels)
-    ax.plot([start_x, start_x + 2 * adj_length + 2 * adj_width], 
-           [start_y, start_y], 
-           color='red', linestyle='--', linewidth=2.0, dashes=(8, 4), solid_capstyle='butt')
-    ax.plot([start_x, start_x + 2 * adj_length + 2 * adj_width], 
-           [start_y + adj_height, start_y + adj_height], 
-           color='red', linestyle='--', linewidth=2.0, dashes=(8, 4), solid_capstyle='butt')
-    
-    # Add DIMENSION LINES (Blue with arrows)
-    dim_offset = 4
-    
-    # Convert cm to inches for display (1 cm = 0.393701 inches)
-    cm_to_inch = 0.393701
-    
-    # Width dimension (right side, vertical)
-    dim_x_right = start_x + 2 * adj_length + 2 * adj_width + dim_offset
-    ax.annotate('', xy=(dim_x_right, start_y + adj_height), xytext=(dim_x_right, start_y),
-                arrowprops=dict(arrowstyle='<->', color='blue', lw=1.5))
-    ax.text(dim_x_right + 1, start_y + adj_height/2, f'{adj_height * cm_to_inch:.0f}"', 
-           ha='left', va='center', fontsize=10, color='blue', rotation=90)
-    
-    # Length dimension (top, first panel)
-    dim_y_top = start_y + adj_height + flap_height + dim_offset
-    ax.annotate('', xy=(start_x + adj_length, dim_y_top), xytext=(start_x, dim_y_top),
-                arrowprops=dict(arrowstyle='<->', color='blue', lw=1.5))
-    ax.text(start_x + adj_length/2, dim_y_top + 1, f'{adj_length * cm_to_inch:.0f}"', 
-           ha='center', va='bottom', fontsize=10, color='blue')
-    
-    # Width dimension (top, second panel)
-    ax.annotate('', xy=(start_x + adj_length + adj_width, dim_y_top), 
-                xytext=(start_x + adj_length, dim_y_top),
-                arrowprops=dict(arrowstyle='<->', color='blue', lw=1.5))
-    ax.text(start_x + adj_length + adj_width/2, dim_y_top + 1, f'{adj_width * cm_to_inch:.0f}"', 
-           ha='center', va='bottom', fontsize=10, color='blue')
-    
-    # Flap height dimension (right side)
-    ax.annotate('', xy=(dim_x_right, start_y + adj_height + flap_height), 
-                xytext=(dim_x_right, start_y + adj_height),
-                arrowprops=dict(arrowstyle='<->', color='blue', lw=1.5))
-    ax.text(dim_x_right + 1, start_y + adj_height + flap_height/2, f'{flap_height * cm_to_inch:.0f}"', 
-           ha='left', va='center', fontsize=9, color='blue', rotation=90)
-    
-    # Total width dimension (bottom)
-    dim_y_bottom = start_y - flap_height - dim_offset
-    total_display_width = 2 * adj_length + 2 * adj_width
-    ax.annotate('', xy=(start_x + total_display_width, dim_y_bottom), 
-                xytext=(start_x, dim_y_bottom),
-                arrowprops=dict(arrowstyle='<->', color='blue', lw=1.5))
-    ax.text(start_x + total_display_width/2, dim_y_bottom - 1, f'{total_display_width * cm_to_inch:.1f}"', 
-           ha='center', va='top', fontsize=10, color='blue')
-    
-    # Create legend box
-    from matplotlib.patches import Rectangle as LegendRect
-    from matplotlib.lines import Line2D
-    
-    legend_x = start_x + 1
-    legend_y = start_y + 1
-    legend_width = 25
-    legend_height = 6
-    
-    # Legend background (white with black border)
-    legend_bg = LegendRect((legend_x, legend_y), legend_width, legend_height,
-                           facecolor='white', edgecolor='black', linewidth=1.5)
-    ax.add_patch(legend_bg)
-    
-    # Legend text and lines
-    legend_items = [
-        ('CUT LINES (Blue Line)', 'blue', '-', 2.5),
-        ('Soft Crease (Red Line)', 'red', '--', 2.0),
-    ]
-    
-    legend_text_x = legend_x + 0.5
-    legend_line_start_x = legend_x + 14
-    legend_line_end_x = legend_x + 19
-    current_legend_y = legend_y + legend_height - 1.5
-    
-    for label, color, style, lw in legend_items:
-        # Draw text
-        ax.text(legend_text_x, current_legend_y, label, 
-               fontsize=9, va='center', ha='left', color='black')
-        # Draw sample line
-        if style == '--':
-            ax.plot([legend_line_start_x, legend_line_end_x], [current_legend_y, current_legend_y],
-                   color=color, linestyle=style, linewidth=lw, dashes=(8, 4))
-        else:
-            ax.plot([legend_line_start_x, legend_line_end_x], [current_legend_y, current_legend_y],
-                   color=color, linestyle=style, linewidth=lw)
-        current_legend_y -= 2.5
-    
-    # Add secondary legend title for dimensions
-    dim_legend_y = current_legend_y - 0.5
-    ax.text(legend_text_x, dim_legend_y, 'DIMENSIONS (Blue line)', 
-           fontsize=9, va='center', ha='left', color='blue', fontweight='bold')
-    
-    # Set axis properties
-    margin = 12
-    ax.set_xlim(-margin, total_width + margin + 8)
-    ax.set_ylim(start_y - flap_height - margin - 2, start_y + adj_height + flap_height + margin + 2)
-    ax.set_aspect('equal')
-    ax.grid(False)
+    print(
+        f"Adjusted dimensions: W={adjusted_width}cm, H={adjusted_height}cm, "
+        f"L={adjusted_length}cm"
+    )
+
+    output_path = save_path or 'carton_dieline.svg'
+    svg_path = build_reference_svg(
+        adjusted_length,
+        adjusted_width,
+        adjusted_height,
+        filename=output_path,
+    )
+    print(f"Dieline saved to: {svg_path}")
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 7))
     ax.axis('off')
-    
-    # Title with dimensions
-    title = f'RSC Carton Shipping Box Dieline\n'
-    title += f'Dimensions: L={adj_length:.1f}cm × W={adj_width:.1f}cm × H={adj_height:.1f}cm'
-    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
-    
-    plt.tight_layout()
-    
-    # Save if path provided
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Dieline saved to: {save_path}")
-    
-    # Show if requested
+    ax.text(
+        0.5,
+        0.62,
+        'Carton dieline exported as SVG',
+        ha='center',
+        va='center',
+        fontsize=20,
+        fontweight='bold',
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.5,
+        0.48,
+        f'Adjusted size: L={adjusted_length:.1f} cm, W={adjusted_width:.1f} cm, H={adjusted_height:.1f} cm',
+        ha='center',
+        va='center',
+        fontsize=14,
+        color='#333333',
+        transform=ax.transAxes,
+    )
+    ax.text(
+        0.5,
+        0.36,
+        f'SVG output: {svg_path}',
+        ha='center',
+        va='center',
+        fontsize=11,
+        color='#555555',
+        transform=ax.transAxes,
+    )
+    fig.tight_layout()
+
     if show:
         plt.show()
-    
+
     return fig
 
 
